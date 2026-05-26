@@ -7,3 +7,4 @@ skill/
 .env.*
 *.local
 coverage/
+.test-dist/

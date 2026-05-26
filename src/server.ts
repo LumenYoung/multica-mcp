@@ -10,6 +10,8 @@ import {
   ensureMulticaCliAvailable,
   formatMulticaError,
 } from "./lib/multica-cli.js";
+import { loadMulticaBackendConfig } from "./lib/multica-http-client.js";
+import type { MulticaBackendConfig, StructuredToolError } from "./lib/multica-types.js";
 import {
   multicaAddComment,
   multicaAddCommentSchema,
@@ -34,6 +36,10 @@ import {
   multicaListAgents,
   multicaListAgentsSchema,
 } from "./tools/multica-list-agents.js";
+import {
+  multicaListWorkspaces,
+  multicaListWorkspacesSchema,
+} from "./tools/multica-list-workspaces.js";
 import {
   multicaListIssues,
   multicaListIssuesSchema,
@@ -112,6 +118,18 @@ import {
   multicaAgentUpdate,
   multicaAgentUpdateSchema,
 } from "./tools/multica-agent-crud.js";
+import {
+  multicaWaitIssue,
+  multicaWaitIssueSchema,
+} from "./tools/multica-wait-issue.js";
+import {
+  multicaRerunIssue,
+  multicaRerunIssueSchema,
+} from "./tools/multica-rerun-issue.js";
+import {
+  multicaCancelTask,
+  multicaCancelTaskSchema,
+} from "./tools/multica-cancel-task.js";
 
 function resolveLogPath(): string {
   const override = process.env.MULTICA_MCP_LOG_PATH;
@@ -133,14 +151,46 @@ function toolResult(data: unknown) {
   };
 }
 
+function isStructuredToolError(value: unknown): value is StructuredToolError {
+  if (typeof value !== "object" || value === null) return false;
+  const candidate = value as Partial<StructuredToolError>;
+  return (
+    typeof candidate.code === "string" &&
+    typeof candidate.message === "string" &&
+    typeof candidate.retryable === "boolean"
+  );
+}
+
+function formatToolError(err: unknown): StructuredToolError | { code: string; message: string; stderr?: string } {
+  if (isStructuredToolError(err)) return err;
+  if (err instanceof Error) {
+    try {
+      const parsed = JSON.parse(err.message) as { error?: unknown };
+      if (isStructuredToolError(parsed.error)) return parsed.error;
+    } catch {
+      // Fall through to CLI/error formatting.
+    }
+  }
+  return formatMulticaError(err);
+}
+
 function toolError(err: unknown) {
-  const error = formatMulticaError(err);
+  const error = formatToolError(err);
   return {
     isError: true,
     content: [
       { type: "text" as const, text: JSON.stringify({ error }) },
     ],
   };
+}
+
+async function validateStartupBackend(): Promise<MulticaBackendConfig> {
+  const config = loadMulticaBackendConfig();
+  if (!config.ok) throw config.error;
+  if (config.data.backend === "cli") {
+    await ensureMulticaCliAvailable();
+  }
+  return config.data;
 }
 
 async function notifyProgress(
@@ -189,7 +239,7 @@ function wrap<I>(
 }
 
 async function main() {
-  await ensureMulticaCliAvailable();
+  await validateStartupBackend();
 
   const server = new McpServer({
     name: "multica-mcp",
@@ -198,9 +248,16 @@ async function main() {
 
   server.tool(
     "multica_list_agents",
-    "List all non-archived Multica agents in the current workspace. Returns id, name, provider, model_hint, description. Cached 5 minutes.",
+    "List all non-archived Multica agents in a workspace. In HTTP mode workspace_id is required. Returns id, name, provider, model_hint, description.",
     multicaListAgentsSchema.shape,
-    wrap("multica_list_agents", async () => multicaListAgents()),
+    wrap("multica_list_agents", async (input) => multicaListAgents(input)),
+  );
+
+  server.tool(
+    "multica_list_workspaces",
+    "List Multica workspaces visible to the authenticated CLI user. Use this to avoid accidentally operating in the wrong workspace.",
+    multicaListWorkspacesSchema,
+    wrap("multica_list_workspaces", async (input) => multicaListWorkspaces(input)),
   );
 
   server.tool(
@@ -275,9 +332,30 @@ async function main() {
 
   server.tool(
     "multica_issue_run_messages",
-    "List messages for a specific execution run. Supports incremental fetch via 'since' sequence number.",
+    "List messages for a specific execution run. Supports incremental fetch via 'since' sequence number and optional issue_id for short task-id resolution.",
     multicaIssueRunMessagesSchema.shape,
     wrap("multica_issue_run_messages", async (input) => multicaIssueRunMessages(input)),
+  );
+
+  server.tool(
+    "multica_wait_issue",
+    "Poll an issue's latest run until it reaches a terminal state or a short timeout. Keep timeout_seconds below the Hermes MCP server timeout; call repeatedly for long jobs.",
+    multicaWaitIssueSchema.shape,
+    wrap("multica_wait_issue", async (input) => multicaWaitIssue(input)),
+  );
+
+  server.tool(
+    "multica_rerun_issue",
+    "Re-enqueue an issue's current agent assignment as a fresh task/run.",
+    multicaRerunIssueSchema.shape,
+    wrap("multica_rerun_issue", async (input) => multicaRerunIssue(input)),
+  );
+
+  server.tool(
+    "multica_cancel_task",
+    "Cancel a running Multica task by task/run UUID.",
+    multicaCancelTaskSchema.shape,
+    wrap("multica_cancel_task", async (input) => multicaCancelTask(input)),
   );
 
   server.tool(
@@ -296,9 +374,9 @@ async function main() {
 
   server.tool(
     "multica_runtime_list",
-    "List runtimes in the workspace. Required to pass runtime_id when creating agents.",
+    "List runtimes in a workspace. In HTTP mode workspace_id is required. Required to pass runtime_id when creating agents.",
     multicaRuntimeListSchema.shape,
-    wrap("multica_runtime_list", async () => multicaRuntimeList()),
+    wrap("multica_runtime_list", async (input) => multicaRuntimeList(input)),
   );
 
   server.tool(

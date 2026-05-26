@@ -18,7 +18,7 @@
     "dev": "tsup --watch",
     "start": "node dist/server.js",
     "test": "node --experimental-strip-types tests/smoke.ts",
-    "test:unit": "node --experimental-transform-types --test tests/unit.test.ts",
+    "test:unit": "tsc -p tsconfig.test.json && node --test .test-dist/tests/unit.test.js",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src tests"
   },

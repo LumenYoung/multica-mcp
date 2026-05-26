@@ -51,11 +51,12 @@ Tool calls are logged as JSONL with `timestamp`, `tool`, `params`, `duration_ms`
 
 | Env var                | Purpose                                                   |
 | ---------------------- | --------------------------------------------------------- |
-| `MULTICA_APP_URL`      | Base URL used when building issue and project URLs        |
-| `MULTICA_MCP_LOG_PATH` | Absolute path override for the JSONL log                  |
-| `XDG_STATE_HOME`       | Standard XDG base dir for the default log location        |
+| `MULTICA_WEB_BASE_URL` | Web base URL used only when building human-facing issue and project URLs |
+| `MULTICA_APP_URL`      | Backwards-compatible alias for `MULTICA_WEB_BASE_URL` during migration   |
+| `MULTICA_MCP_LOG_PATH` | Absolute path override for the JSONL log                                 |
+| `XDG_STATE_HOME`       | Standard XDG base dir for the default log location                       |
 
-When `MULTICA_APP_URL` is unset, the server reads `multica config show` and, if nothing matches, returns a `null` URL (no localhost fallback).
+When no web base URL is configured, tools still return stable IDs and use `null`/omitted URLs rather than guessing localhost. API requests must use `MULTICA_API_BASE_URL`, not the web base URL.
 
 ## Tools
 

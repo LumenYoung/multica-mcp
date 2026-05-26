@@ -7,6 +7,10 @@ import {
   resolveProject,
 } from "../lib/projects.js";
 import { runMulticaJson } from "../lib/multica-cli.js";
+import {
+  getMulticaBackendConfig,
+  getMulticaHttpClient,
+} from "../lib/multica-http-client.js";
 import type { IssueListResponse, ListResult } from "../lib/types.js";
 
 const STATUSES = [
@@ -28,6 +32,7 @@ const priorityRank: Record<string, number> = {
 };
 
 export const multicaListIssuesSchema = z.object({
+  workspace_id: z.string().min(1).optional(),
   status: z.union([z.enum(STATUSES), z.array(z.enum(STATUSES))]).optional(),
   assignee: z.string().optional(),
   project: z.string().optional(),
@@ -58,9 +63,37 @@ type ListIssuesResult = ListResult<IssueSummary> & {
 
 export async function multicaListIssues(
   input: MulticaListIssuesInput,
-): Promise<ListIssuesResult> {
+): Promise<ListIssuesResult | { error: unknown }> {
   const limit = input.limit ?? 20;
   const offset = input.offset ?? 0;
+  const backendConfig = getMulticaBackendConfig();
+  if (backendConfig.backend === "http") {
+    if (!input.workspace_id) {
+      return { error: { code: "workspace_id_required", message: "workspace_id is required.", retryable: false } };
+    }
+    if (input.assignee) {
+      return { error: { code: "validation_failed", message: "HTTP mode requires assignee_id filtering; assignee-name resolution is not migrated yet.", retryable: false } };
+    }
+    if (input.project) {
+      return { error: { code: "validation_failed", message: "HTTP mode requires project_id filtering; project-name resolution is not migrated yet.", retryable: false } };
+    }
+    const status = typeof input.status === "string" ? input.status : undefined;
+    const result = await getMulticaHttpClient().listIssues(input.workspace_id, { status, limit, offset });
+    if (result.ok === false) return { error: result.error };
+    return {
+      ...result.data,
+      items: result.data.items.map((issue) => ({
+        id: issue.id,
+        short_id: issue.short_id,
+        title: issue.title,
+        status: issue.status,
+        assignee: issue.assignee_id,
+        project: issue.project_id,
+        priority: issue.priority,
+        updated_at: issue.updated_at,
+      })),
+    };
+  }
   const args = [
     "issue", "list",
     "--limit", String(Math.min(limit * 3, 300)),

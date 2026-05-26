@@ -10,7 +10,9 @@ export type AgentCreateArgsInput = {
   runtime_id: string;
   description?: string;
   instructions?: string;
+  model?: string;
   custom_args?: string[];
+  custom_env?: Record<string, string>;
   runtime_config?: Record<string, unknown>;
   visibility?: AgentVisibility;
   max_concurrent_tasks?: number;
@@ -29,11 +31,15 @@ export function buildAgentCreateArgs(input: AgentCreateArgsInput): string[] {
   if (input.description) args.push("--description", input.description);
   if (input.instructions) args.push("--instructions", input.instructions);
   if (input.visibility) args.push("--visibility", input.visibility);
+  if (input.model !== undefined) args.push("--model", input.model);
   if (input.max_concurrent_tasks !== undefined) {
     args.push("--max-concurrent-tasks", String(input.max_concurrent_tasks));
   }
   if (input.custom_args) {
     args.push("--custom-args", stringifyFlag(input.custom_args));
+  }
+  if (input.custom_env) {
+    args.push("--custom-env-stdin");
   }
   if (input.runtime_config) {
     args.push("--runtime-config", stringifyFlag(input.runtime_config));
@@ -47,7 +53,9 @@ export type AgentUpdateArgsInput = {
   name?: string;
   description?: string;
   instructions?: string;
+  model?: string;
   custom_args?: string[];
+  custom_env?: Record<string, string>;
   runtime_config?: Record<string, unknown>;
   visibility?: AgentVisibility;
   runtime_id?: string;
@@ -64,11 +72,15 @@ export function buildAgentUpdateArgs(input: AgentUpdateArgsInput): string[] {
   if (input.visibility) args.push("--visibility", input.visibility);
   if (input.runtime_id) args.push("--runtime-id", input.runtime_id);
   if (input.status) args.push("--status", input.status);
+  if (input.model !== undefined) args.push("--model", input.model);
   if (input.max_concurrent_tasks !== undefined) {
     args.push("--max-concurrent-tasks", String(input.max_concurrent_tasks));
   }
   if (input.custom_args) {
     args.push("--custom-args", stringifyFlag(input.custom_args));
+  }
+  if (input.custom_env) {
+    args.push("--custom-env-stdin");
   }
   if (input.runtime_config) {
     args.push("--runtime-config", stringifyFlag(input.runtime_config));
@@ -146,6 +158,7 @@ export function buildAutopilotTriggerDeleteArgs(
 
 export type IssueRunMessagesArgsInput = {
   task_id: string;
+  issue_id?: string;
   since?: number;
 };
 
@@ -153,6 +166,7 @@ export function buildIssueRunMessagesArgs(
   input: IssueRunMessagesArgsInput,
 ): string[] {
   const args = ["issue", "run-messages", input.task_id];
+  if (input.issue_id !== undefined) args.push("--issue", input.issue_id);
   if (input.since !== undefined) args.push("--since", String(input.since));
   return args;
 }

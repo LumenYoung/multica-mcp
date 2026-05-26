@@ -8,6 +8,12 @@ import {
   multicaUpdateAutopilotSchema,
 } from "../src/lib/autopilot-input-schemas.ts";
 import { resolveIssueId } from "../src/lib/issues.ts";
+import {
+  MulticaHttpClient,
+  loadMulticaBackendConfig,
+  mapFetchError,
+} from "../src/lib/multica-http-client.ts";
+import { isStructuredToolError } from "../src/lib/multica-types.ts";
 
 import { TtlCache } from "../src/lib/cache.ts";
 import {
@@ -22,6 +28,274 @@ import {
 import { parseAttachmentDownloadPath } from "../src/lib/attachment-download.ts";
 import { closestMatch, levenshtein } from "../src/lib/fuzzy.ts";
 import { extractModelHint } from "../src/lib/model-hint.ts";
+
+test("loadMulticaBackendConfig: rejects unset backend", () => {
+  const result = loadMulticaBackendConfig({});
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.equal(result.error.code, "validation_failed");
+    assert.match(result.error.message, /MULTICA_BACKEND/);
+  }
+});
+
+test("loadMulticaBackendConfig: validates http config without pinging backend", () => {
+  const result = loadMulticaBackendConfig({
+    MULTICA_BACKEND: "http",
+    MULTICA_API_BASE_URL: "http://multica-backend:8080",
+    MULTICA_WEB_BASE_URL: "https://kanban.lumeny.io",
+    MULTICA_TOKEN: "secret-token",
+  });
+
+  assert.equal(result.ok, true);
+  if (result.ok) {
+    assert.equal(result.data.backend, "http");
+    assert.equal(result.data.apiBaseUrl, "http://multica-backend:8080");
+    assert.equal(result.data.webBaseUrl, "https://kanban.lumeny.io");
+    assert.equal(result.data.token, "secret-token");
+  }
+});
+
+test("loadMulticaBackendConfig: rejects http mode without token", () => {
+  const result = loadMulticaBackendConfig({
+    MULTICA_BACKEND: "http",
+    MULTICA_API_BASE_URL: "http://multica-backend:8080",
+  });
+
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.equal(result.error.code, "auth_not_configured");
+    assert.equal(result.error.retryable, false);
+  }
+});
+
+test("mapFetchError: redacts token-like material", () => {
+  const error = mapFetchError(
+    new Error("fetch failed for Authorization: Bearer abc123token"),
+    { operation: "listWorkspaces", endpoint: "/api/workspaces", apiBaseUrl: "http://multica-backend:8080" },
+  );
+
+  assert.equal(error.code, "api_unreachable");
+  assert.equal(error.retryable, true);
+  assert.doesNotMatch(error.message, /abc123token/);
+  assert.equal(error.details?.api_base_url, "http://multica-backend:8080");
+});
+
+test("MulticaHttpClient: maps workspace list response to natural result", async () => {
+  const calls: Array<{ url: string; headers: Record<string, string> }> = [];
+  const client = new MulticaHttpClient(
+    {
+      backend: "http",
+      apiBaseUrl: "http://multica-backend:8080",
+      webBaseUrl: "https://kanban.lumeny.io",
+      token: "secret-token",
+    },
+    async (url, init) => {
+      calls.push({
+        url: String(url),
+        headers: init?.headers as Record<string, string>,
+      });
+      return new Response(JSON.stringify({ workspaces: [{ id: "w1", name: "work" }] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  );
+
+  const result = await client.listWorkspaces();
+  assert.equal(result.ok, true);
+  if (result.ok) {
+    assert.deepEqual(result.data, { items: [{ id: "w1", name: "work" }], count: 1 });
+  }
+  assert.equal(calls[0]?.url, "http://multica-backend:8080/api/workspaces");
+  assert.equal(calls[0]?.headers.Authorization, "Bearer secret-token");
+});
+
+test("MulticaHttpClient: schema drift returns structured internal_error", async () => {
+  const client = new MulticaHttpClient(
+    {
+      backend: "http",
+      apiBaseUrl: "http://multica-backend:8080",
+      token: "secret-token",
+    },
+    async () => new Response(JSON.stringify({ workspaces: [{ name: "missing id" }] }), { status: 200 }),
+  );
+
+  const result = await client.listWorkspaces();
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.equal(result.error.code, "internal_error");
+    assert.equal(result.error.details?.source, "backend_response_validation");
+    assert.equal(isStructuredToolError(result.error), true);
+  }
+});
+
+test("MulticaHttpClient: maps backend workspace_id 400 to workspace_id_required", async () => {
+  const client = new MulticaHttpClient(
+    { backend: "http", apiBaseUrl: "http://multica-backend:8080", token: "secret-token" },
+    async () => new Response(JSON.stringify({ error: "workspace_id is required" }), { status: 400 }),
+  );
+
+  const result = await client.issueRuns("i1");
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.equal(result.error.code, "workspace_id_required");
+    assert.equal(result.error.retryable, false);
+    assert.equal(result.error.details?.status, 400);
+  }
+});
+
+test("MulticaHttpClient: listAgents requires explicit workspace_id", async () => {
+  const client = new MulticaHttpClient(
+    { backend: "http", apiBaseUrl: "http://multica-backend:8080", token: "secret-token" },
+    async () => {
+      throw new Error("fetch should not be called");
+    },
+  );
+
+  const result = await client.listAgents("");
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.error.code, "workspace_id_required");
+});
+
+test("MulticaHttpClient: listAgents echoes workspace_id and maps result", async () => {
+  const client = new MulticaHttpClient(
+    { backend: "http", apiBaseUrl: "http://multica-backend:8080", token: "secret-token" },
+    async () => new Response(JSON.stringify({ agents: [{ id: "a1", name: "Codex DGX", runtime_id: "r1", runtime_mode: "codex", status: "active", custom_args: ["--model", "gpt-5"] }] }), { status: 200 }),
+  );
+
+  const result = await client.listAgents("w1");
+  assert.equal(result.ok, true);
+  if (result.ok) {
+    assert.equal(result.data.workspace_id, "w1");
+    assert.equal(result.data.count, 1);
+    assert.equal(result.data.items[0]?.name, "Codex DGX");
+  }
+});
+
+test("MulticaHttpClient: listRuntimes echoes workspace_id", async () => {
+  const client = new MulticaHttpClient(
+    { backend: "http", apiBaseUrl: "http://multica-backend:8080", token: "secret-token" },
+    async () => new Response(JSON.stringify({ runtimes: [{ id: "r1", name: "dgx", provider: "codex", runtime_mode: "agent", status: "online", last_seen_at: "2026-01-01T00:00:00Z" }] }), { status: 200 }),
+  );
+
+  const result = await client.listRuntimes("w1");
+  assert.equal(result.ok, true);
+  if (result.ok) {
+    assert.equal(result.data.workspace_id, "w1");
+    assert.deepEqual(result.data.items.map((runtime) => runtime.id), ["r1"]);
+  }
+});
+
+test("MulticaHttpClient: createIssue posts workspace-scoped payload", async () => {
+  const calls: Array<{ url: string; init?: RequestInit; body: unknown }> = [];
+  const client = new MulticaHttpClient(
+    { backend: "http", apiBaseUrl: "http://multica-backend:8080", webBaseUrl: "https://kanban.lumeny.io", token: "secret-token" },
+    async (url, init) => {
+      calls.push({ url: String(url), init, body: JSON.parse(String(init?.body)) });
+      return new Response(JSON.stringify({ id: "i1", identifier: "WOR-1", title: "Test", status: "todo", priority: "low", assignee_id: "a1", project_id: null, updated_at: "2026-01-01T00:00:00Z" }), { status: 201 });
+    },
+  );
+
+  const result = await client.createIssue("w1", { title: "Test", description: "Body", priority: "low", assignee_id: "a1" });
+  assert.equal(result.ok, true);
+  assert.equal(calls[0]?.url, "http://multica-backend:8080/api/issues?workspace_id=w1");
+  assert.equal(calls[0]?.init?.method, "POST");
+  assert.deepEqual(calls[0]?.body, { title: "Test", description: "Body", priority: "low", assignee_id: "a1", assignee_type: "agent" });
+  if (result.ok) assert.equal(result.data.url, "https://kanban.lumeny.io/issues/i1");
+});
+
+test("MulticaHttpClient: listIssues maps pagination", async () => {
+  const client = new MulticaHttpClient(
+    { backend: "http", apiBaseUrl: "http://multica-backend:8080", token: "secret-token" },
+    async () => new Response(JSON.stringify({ issues: [{ id: "i1", identifier: "WOR-1", title: "T", status: "todo", priority: "medium", assignee_id: null, project_id: null, created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-02T00:00:00Z" }], total: 1, limit: 20, offset: 0, has_more: false }), { status: 200 }),
+  );
+
+  const result = await client.listIssues("w1", { status: "todo", limit: 20, offset: 0 });
+  assert.equal(result.ok, true);
+  if (result.ok) {
+    assert.equal(result.data.items[0]?.short_id, "WOR-1");
+    assert.equal(result.data.total, 1);
+  }
+});
+
+test("MulticaHttpClient: issue runs and messages use real user-facing endpoints", async () => {
+  const seen: string[] = [];
+  const client = new MulticaHttpClient(
+    { backend: "http", apiBaseUrl: "http://multica-backend:8080", token: "secret-token" },
+    async (url) => {
+      seen.push(String(url));
+      if (String(url).includes("task-runs")) {
+        return new Response(JSON.stringify([{ id: "t1", issue_id: "i1", status: "completed", created_at: "2026-01-01T00:00:00Z" }]), { status: 200 });
+      }
+      return new Response(JSON.stringify([{ seq: 1, task_id: "t1", issue_id: "i1", type: "text", content: "done" }]), { status: 200 });
+    },
+  );
+
+  const runs = await client.issueRuns("i1", "w1");
+  const messages = await client.issueRunMessages("t1", 1, "w1");
+  assert.equal(runs.ok, true);
+  assert.equal(messages.ok, true);
+  assert.equal(seen[0], "http://multica-backend:8080/api/issues/i1/task-runs?workspace_id=w1");
+  assert.equal(seen[1], "http://multica-backend:8080/api/tasks/t1/messages?since=1&workspace_id=w1");
+});
+
+test("MulticaHttpClient: createIssue posts JSON and constructs web URL", async () => {
+  const calls: Array<{ url: string; method?: string; body?: string }> = [];
+  const client = new MulticaHttpClient(
+    { backend: "http", apiBaseUrl: "http://multica-backend:8080", webBaseUrl: "https://kanban.lumeny.io", token: "secret-token" },
+    async (url, init) => {
+      calls.push({ url: String(url), method: init?.method, body: String(init?.body) });
+      return new Response(JSON.stringify({ id: "i1", identifier: "WRK-1", title: "Test", status: "todo", priority: "medium", assignee_id: "a1", project_id: null, updated_at: "2026-01-01T00:00:00Z" }), { status: 200 });
+    },
+  );
+
+  const result = await client.createIssue("w1", { title: "Test", assignee_id: "a1", priority: "medium" });
+  assert.equal(result.ok, true);
+  if (result.ok) assert.equal(result.data.url, "https://kanban.lumeny.io/issues/i1");
+  assert.equal(calls[0]?.url, "http://multica-backend:8080/api/issues?workspace_id=w1");
+  assert.equal(calls[0]?.method, "POST");
+  assert.match(calls[0]?.body ?? "", /"assignee_type":"agent"/);
+});
+
+test("MulticaHttpClient: updateIssue uses PUT", async () => {
+  const calls: Array<{ method?: string; body?: string }> = [];
+  const client = new MulticaHttpClient(
+    { backend: "http", apiBaseUrl: "http://multica-backend:8080", token: "secret-token" },
+    async (_url, init) => {
+      calls.push({ method: init?.method, body: String(init?.body) });
+      return new Response(JSON.stringify({ id: "i1", identifier: "WRK-1", title: "Test", status: "cancelled", priority: "medium", assignee_id: null, project_id: null, updated_at: "2026-01-01T00:00:00Z" }), { status: 200 });
+    },
+  );
+
+  const result = await client.updateIssue("i1", { status: "cancelled" });
+  assert.equal(result.ok, true);
+  assert.equal(calls[0]?.method, "PUT");
+  assert.match(calls[0]?.body ?? "", /"status":"cancelled"/);
+});
+
+test("MulticaHttpClient: issue runs/messages/rerun/cancel map endpoints", async () => {
+  const urls: string[] = [];
+  const client = new MulticaHttpClient(
+    { backend: "http", apiBaseUrl: "http://multica-backend:8080", token: "secret-token" },
+    async (url, init) => {
+      urls.push(`${init?.method ?? "GET"} ${String(url)}`);
+      if (String(url).includes("messages")) return new Response(JSON.stringify([{ seq: 1, content: "hi" }]), { status: 200 });
+      if (String(url).includes("task-runs")) return new Response(JSON.stringify([{ id: "t1", status: "running", created_at: "2026-01-01T00:00:00Z" }]), { status: 200 });
+      return new Response(JSON.stringify({ id: "t1", status: "cancelled", created_at: "2026-01-01T00:00:00Z" }), { status: 200 });
+    },
+  );
+
+  assert.equal((await client.issueRuns("i1", "w1")).ok, true);
+  assert.equal((await client.issueRunMessages("t1", 2, "w1")).ok, true);
+  assert.equal((await client.rerunIssue("i1", "w1")).ok, true);
+  assert.equal((await client.cancelTask("i1", "t1", "w1")).ok, true);
+  assert.deepEqual(urls, [
+    "GET http://multica-backend:8080/api/issues/i1/task-runs?workspace_id=w1",
+    "GET http://multica-backend:8080/api/tasks/t1/messages?since=2&workspace_id=w1",
+    "POST http://multica-backend:8080/api/issues/i1/rerun?workspace_id=w1",
+    "POST http://multica-backend:8080/api/issues/i1/tasks/t1/cancel?workspace_id=w1",
+  ]);
+});
 
 test("TtlCache: get returns stored value within TTL", () => {
   const cache = new TtlCache<number>(1_000);
@@ -117,7 +391,9 @@ test("buildAgentCreateArgs: matches the current Multica CLI contract", () => {
       instructions: "Stay concise.",
       visibility: "workspace",
       max_concurrent_tasks: 2,
-      custom_args: ["--model", "gpt-5"],
+      model: "gpt-5",
+      custom_args: ["--reasoning", "high"],
+      custom_env: { SAFE_KEY: "value" },
       runtime_config: { region: "eu-west-1" },
     }),
     [
@@ -133,10 +409,13 @@ test("buildAgentCreateArgs: matches the current Multica CLI contract", () => {
       "Stay concise.",
       "--visibility",
       "workspace",
+      "--model",
+      "gpt-5",
       "--max-concurrent-tasks",
       "2",
       "--custom-args",
-      "[\"--model\",\"gpt-5\"]",
+      "[\"--reasoning\",\"high\"]",
+      "--custom-env-stdin",
       "--runtime-config",
       "{\"region\":\"eu-west-1\"}",
     ],
@@ -224,13 +503,14 @@ test("buildAutopilotTriggerDeleteArgs: uses trigger-delete subcommand", () => {
   );
 });
 
-test("buildIssueRunMessagesArgs: includes since when provided", () => {
+test("buildIssueRunMessagesArgs: includes issue and since when provided", () => {
   assert.deepEqual(
     buildIssueRunMessagesArgs({
       task_id: "task-123",
+      issue_id: "issue-456",
       since: 42,
     }),
-    ["issue", "run-messages", "task-123", "--since", "42"],
+    ["issue", "run-messages", "task-123", "--issue", "issue-456", "--since", "42"],
   );
 });
 
